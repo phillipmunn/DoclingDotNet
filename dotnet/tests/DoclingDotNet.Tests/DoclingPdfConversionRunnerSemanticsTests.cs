@@ -777,6 +777,33 @@ public sealed class DoclingPdfConversionRunnerSemanticsTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_WhenInputStreamProvided_UsesLoadDocumentFromBytesAndSucceeds()
+    {
+        var fake = new FakeParseSession
+        {
+            PageCount = 1
+        };
+
+        var runner = new DoclingPdfConversionRunner(
+            sessionFactory: _ => fake);
+
+        var expectedBytes = new byte[] { 1, 2, 3, 4, 5 };
+        using var memoryStream = new MemoryStream(expectedBytes);
+
+        var result = await runner.ExecuteAsync(new PdfConversionRequest
+        {
+            InputStream = memoryStream,
+            RunId = "run-stream",
+            Timeout = TimeSpan.FromSeconds(2)
+        });
+
+        Assert.Equal(PipelineRunStatus.Succeeded, result.Pipeline.Status);
+        Assert.Equal(1, fake.LoadDocumentFromBytesCalls);
+        Assert.Equal(expectedBytes, fake.LastLoadedBytes);
+        Assert.Equal(1, result.Pages.Count);
+    }
+
+    [Fact]
     public async Task ExecuteBatchAsync_WhenContinueOnDocumentFailureIsFalse_SkipsRemainingDocuments()
     {
         var first = new FakeParseSession
@@ -1127,8 +1154,13 @@ public sealed class DoclingPdfConversionRunnerSemanticsTests
         {
         }
 
+        public int LoadDocumentFromBytesCalls { get; private set; }
+        public byte[]? LastLoadedBytes { get; private set; }
+
         public void LoadDocumentFromBytes(string key, byte[] bytes, string? description = null, string? password = null)
         {
+            LoadDocumentFromBytesCalls++;
+            LastLoadedBytes = bytes;
         }
 
         public void UnloadDocument(string key)
