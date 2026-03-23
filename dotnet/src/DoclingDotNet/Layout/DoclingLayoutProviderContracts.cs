@@ -16,7 +16,10 @@ public sealed class LayoutProcessRequest
 {
     public required string RunId { get; init; }
     public required string DocumentKey { get; init; }
-    public required string FilePath { get; init; }
+    /// <summary>Path to the PDF file on disk. Mutually exclusive with <see cref="PdfBytes"/>.</summary>
+    public string? FilePath { get; init; }
+    /// <summary>Raw PDF bytes when the source was a stream. Mutually exclusive with <see cref="FilePath"/>.</summary>
+    public byte[]? PdfBytes { get; init; }
     public required IReadOnlyList<SegmentedPdfPageDto> Pages { get; init; }
 }
 

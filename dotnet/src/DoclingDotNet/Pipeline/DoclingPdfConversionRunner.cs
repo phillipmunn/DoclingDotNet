@@ -352,6 +352,7 @@ public sealed class DoclingPdfConversionRunner
         var pageErrors = new List<PdfPageDecodeError>();
         var diagnostics = new List<PdfConversionDiagnostic>();
 
+        byte[]? pdfBytes = null;
         IDoclingParseSession? session = null;
         var documentLoaded = false;
         var pageCount = 0;
@@ -396,7 +397,8 @@ public sealed class DoclingPdfConversionRunner
                                           {
                                               using var ms = new MemoryStream();
                                               await request.InputStream.CopyToAsync(ms, token).ConfigureAwait(false);
-                                              parseSession.LoadDocumentFromBytes(documentKey, ms.ToArray(), "stream", request.Password);
+                                              pdfBytes = ms.ToArray();
+                                              parseSession.LoadDocumentFromBytes(documentKey, pdfBytes, "stream", request.Password);
                                           }
                                           else
                                           {
@@ -671,7 +673,8 @@ public sealed class DoclingPdfConversionRunner
                         {
                             RunId = runId,
                             DocumentKey = documentKey,
-                            FilePath = request.FilePath ?? "stream",
+                            FilePath = request.FilePath,
+                            PdfBytes = pdfBytes,
                             Pages = pages.ToArray()
                         };
 

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using DoclingDotNet.Algorithms.Layout;
@@ -76,9 +77,27 @@ public sealed class OnnxLayoutProvider : IDoclingLayoutProvider, IDisposable
         var runTask = Task.Run(() =>
         {
             var doc = IntPtr.Zero;
+            GCHandle? pdfBytesHandle = null;
             try
             {
-                doc = PdfiumNative.FPDF_LoadDocument(request.FilePath, null);
+                if (request.PdfBytes != null)
+                {
+                    pdfBytesHandle = GCHandle.Alloc(request.PdfBytes, GCHandleType.Pinned);
+                    doc = PdfiumNative.FPDF_LoadMemDocument(
+                        pdfBytesHandle.Value.AddrOfPinnedObject(),
+                        request.PdfBytes.Length,
+                        null);
+                }
+                else if (!string.IsNullOrEmpty(request.FilePath))
+                {
+                    doc = PdfiumNative.FPDF_LoadDocument(request.FilePath, null);
+                }
+                else
+                {
+                    throw new InvalidOperationException(
+                        "LayoutProcessRequest must have either FilePath or PdfBytes set.");
+                }
+
                 if (doc == IntPtr.Zero)
                 {
                     throw new InvalidOperationException("Failed to load PDF document into Pdfium.");
@@ -182,6 +201,7 @@ public sealed class OnnxLayoutProvider : IDoclingLayoutProvider, IDisposable
                 {
                     PdfiumNative.FPDF_CloseDocument(doc);
                 }
+                pdfBytesHandle?.Free();
             }
             
             return LayoutProcessResult.Succeeded(results, "ONNX inference completed successfully.");

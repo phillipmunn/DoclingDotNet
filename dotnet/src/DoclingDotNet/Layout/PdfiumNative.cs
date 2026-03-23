@@ -16,6 +16,10 @@ internal static partial class PdfiumNative
     [DllImport(PdfiumDll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     internal static extern IntPtr FPDF_LoadDocument(string file_path, string? password);
 
+    // data_buf must remain pinned for the lifetime of the returned document handle.
+    [DllImport(PdfiumDll, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr FPDF_LoadMemDocument(IntPtr data_buf, int size, string? password);
+
     [DllImport(PdfiumDll, CallingConvention = CallingConvention.Cdecl)]
     internal static extern void FPDF_CloseDocument(IntPtr document);
 
