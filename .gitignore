@@ -2,6 +2,7 @@
 .DS_Store
 Thumbs.db
 .idea/
+.vs/
 .vscode/
 
 # .NET build artifacts
@@ -19,6 +20,7 @@ build_*.txt
 dotnet/examples/Spike.OnnxRuntime/models/
 
 # Upstream cloned repositories (reference-only)
+/upstream/*
 /upstream/deps
 /upstream/docling
 /upstream/audio-testing-samples
@@ -26,6 +28,9 @@ dotnet/examples/Spike.OnnxRuntime/models/
 /upstream/docling/**
 /upstream/audio-testing-samples/**
 !/upstream/README.md
+
+# Models too big to commit.
+model.onnx
 
 # Keep root workspace-focused files tracked
 !.agent/
