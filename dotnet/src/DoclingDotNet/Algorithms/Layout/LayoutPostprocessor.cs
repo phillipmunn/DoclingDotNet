@@ -103,6 +103,7 @@ public sealed class LayoutPostprocessor
     {
         _regularClusters = ProcessRegularClusters();
         _specialClusters = ProcessSpecialClusters();
+        AbsorbTableContinuationRows();
 
         var containedIds = new HashSet<int>();
         foreach (var wrapper in _specialClusters)
@@ -117,6 +118,7 @@ public sealed class LayoutPostprocessor
         }
 
         _regularClusters.RemoveAll(c => containedIds.Contains(c.Id));
+        _regularClusters = SplitMultiRowListItemClusters(_regularClusters);
 
         var finalClusters = SortClusters(_regularClusters.Concat(_specialClusters).ToList(), "id");
 
@@ -188,6 +190,196 @@ public sealed class LayoutPostprocessor
         }
 
         return clusters;
+    }
+
+    private List<LayoutCluster> SplitMultiRowListItemClusters(List<LayoutCluster> clusters)
+    {
+        if (clusters.Count == 0)
+        {
+            return clusters;
+        }
+
+        var nextId = Math.Max(
+            _allClusters.Count > 0 ? _allClusters.Max(cluster => cluster.Id) : 0,
+            clusters.Max(cluster => cluster.Id)) + 1;
+        var splitClusters = new List<LayoutCluster>(clusters.Count);
+
+        foreach (var cluster in clusters)
+        {
+            if (cluster.Cells.Count <= 1)
+            {
+                splitClusters.Add(cluster);
+                continue;
+            }
+
+            var rows = GroupCellsIntoRows(cluster.Cells);
+            if (!ShouldSplitClusterIntoRows(cluster, rows))
+            {
+                splitClusters.Add(cluster);
+                continue;
+            }
+
+            for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+            {
+                var rowCells = SortCells(rows[rowIndex]);
+                splitClusters.Add(new LayoutCluster
+                {
+                    Id = rowIndex == 0 ? cluster.Id : nextId++,
+                    Label = cluster.Label,
+                    Confidence = cluster.Confidence,
+                    Bbox = GetBoundingBox(rowCells),
+                    Cells = rowCells
+                });
+            }
+        }
+
+        return splitClusters;
+    }
+
+    private static bool ShouldSplitClusterIntoRows(LayoutCluster cluster, IReadOnlyList<List<PdfTextCellDto>> rows)
+    {
+        if (rows.Count <= 1)
+        {
+            return false;
+        }
+
+        if (string.Equals(cluster.Label, "list_item", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (!string.Equals(cluster.Label, "text", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (rows.Count < 3 || rows.Any(row => row.Count != 1))
+        {
+            return false;
+        }
+
+        var averageRowWidth = rows.Average(row => GetBoundingBox(row).Width);
+        if (cluster.Bbox.Width <= 0)
+        {
+            return false;
+        }
+
+        return averageRowWidth / cluster.Bbox.Width <= 0.8;
+    }
+
+    private void AbsorbTableContinuationRows()
+    {
+        var textClusters = _regularClusters
+            .Where(c => c.Label == "text" && c.Cells.Count == 1)
+            .ToList();
+
+        if (textClusters.Count == 0)
+        {
+            return;
+        }
+
+        var absorbedClusterIds = new HashSet<int>();
+
+        foreach (var tableCluster in _specialClusters.Where(c => c.Label == "table" && c.Cells.Count > 0))
+        {
+            var columnCenters = GetColumnCenters(tableCluster.Cells);
+            if (columnCenters.Count < 2)
+            {
+                continue;
+            }
+
+            var averageCellHeight = Math.Max(
+                1.0,
+                tableCluster.Cells.Average(cell => Math.Max(1.0, cell.Rect.ToBoundingBox().Height)));
+            var horizontalTolerance = Math.Max(12.0, averageCellHeight);
+            var verticalTolerance = Math.Max(18.0, averageCellHeight * 1.5);
+            var currentBottom = tableCluster.Bbox.B;
+
+            var candidateRows = GroupSingleCellTextClustersIntoRows(
+                textClusters.Where(cluster => !absorbedClusterIds.Contains(cluster.Id))
+                    .Where(cluster =>
+                    {
+                        var box = cluster.Cells[0].Rect.ToBoundingBox();
+                        return box.L >= tableCluster.Bbox.L - horizontalTolerance
+                               && box.R <= tableCluster.Bbox.R + horizontalTolerance
+                               && box.T <= tableCluster.Bbox.T + verticalTolerance;
+                    })
+                    .ToList());
+
+            foreach (var row in candidateRows)
+            {
+                var rowTop = row.Max(cluster => cluster.Cells[0].Rect.ToBoundingBox().T);
+                if (rowTop > currentBottom + verticalTolerance)
+                {
+                    continue;
+                }
+
+                if (currentBottom - rowTop > verticalTolerance)
+                {
+                    break;
+                }
+
+                var alignedCells = row.Count(cluster =>
+                {
+                    var box = cluster.Cells[0].Rect.ToBoundingBox();
+                    var centerX = (box.L + box.R) / 2;
+                    return columnCenters.Any(columnCenter => Math.Abs(columnCenter - centerX) <= horizontalTolerance);
+                });
+
+                if (alignedCells < Math.Min(2, columnCenters.Count))
+                {
+                    continue;
+                }
+
+                foreach (var cluster in row)
+                {
+                    tableCluster.Cells.Add(cluster.Cells[0]);
+                    absorbedClusterIds.Add(cluster.Id);
+                }
+
+                tableCluster.Cells = SortCells(DeduplicateCells(tableCluster.Cells));
+                currentBottom = Math.Min(currentBottom, row.Min(cluster => cluster.Cells[0].Rect.ToBoundingBox().B));
+                ExpandClusterToCells(tableCluster);
+            }
+
+            var rowCenters = GetRowCenters(tableCluster.Cells);
+            foreach (var textCluster in textClusters.Where(cluster => !absorbedClusterIds.Contains(cluster.Id)))
+            {
+                var box = textCluster.Cells[0].Rect.ToBoundingBox();
+                var centerX = (box.L + box.R) / 2;
+                var centerY = (box.T + box.B) / 2;
+
+                var alignedToColumn = columnCenters.Any(columnCenter => Math.Abs(columnCenter - centerX) <= horizontalTolerance);
+                var alignedToRow = rowCenters.Any(rowCenter => Math.Abs(rowCenter - centerY) <= verticalTolerance);
+                var withinTableBounds = box.L >= tableCluster.Bbox.L - horizontalTolerance
+                                        && box.R <= tableCluster.Bbox.R + horizontalTolerance
+                                        && box.T <= tableCluster.Bbox.T + verticalTolerance
+                                        && box.B >= tableCluster.Bbox.B - verticalTolerance;
+
+                if (!alignedToColumn || !alignedToRow || !withinTableBounds)
+                {
+                    continue;
+                }
+
+                tableCluster.Cells.Add(textCluster.Cells[0]);
+                absorbedClusterIds.Add(textCluster.Id);
+            }
+
+            if (absorbedClusterIds.Count > 0)
+            {
+                tableCluster.Cells = SortCells(DeduplicateCells(tableCluster.Cells));
+                ExpandClusterToCells(tableCluster);
+            }
+        }
+
+        if (absorbedClusterIds.Count == 0)
+        {
+            return;
+        }
+
+        _regularClusters = _regularClusters
+            .Where(cluster => !absorbedClusterIds.Contains(cluster.Id))
+            .ToList();
     }
 
     private List<LayoutCluster> ProcessSpecialClusters()
@@ -325,6 +517,171 @@ public sealed class LayoutPostprocessor
         }
 
         return _cells.Where(c => !assigned.Contains(c.Index) && !string.IsNullOrWhiteSpace(c.Text)).ToList();
+    }
+
+    private static List<List<LayoutCluster>> GroupSingleCellTextClustersIntoRows(List<LayoutCluster> clusters)
+    {
+        var rows = new List<List<LayoutCluster>>();
+
+        foreach (var cluster in clusters.OrderByDescending(c => c.Cells[0].Rect.ToBoundingBox().T).ThenBy(c => c.Cells[0].Rect.ToBoundingBox().L))
+        {
+            var box = cluster.Cells[0].Rect.ToBoundingBox();
+            var centerY = (box.T + box.B) / 2;
+            var height = Math.Max(1.0, box.Height);
+
+            if (rows.Count == 0)
+            {
+                rows.Add([cluster]);
+                continue;
+            }
+
+            var currentRow = rows[^1];
+            var rowCenterY = currentRow.Average(item =>
+            {
+                var rowBox = item.Cells[0].Rect.ToBoundingBox();
+                return (rowBox.T + rowBox.B) / 2;
+            });
+            var rowHeight = Math.Max(
+                1.0,
+                currentRow.Average(item => Math.Max(1.0, item.Cells[0].Rect.ToBoundingBox().Height)));
+            var tolerance = Math.Max(6.0, Math.Max(height, rowHeight) * 0.6);
+
+            if (Math.Abs(centerY - rowCenterY) <= tolerance)
+            {
+                currentRow.Add(cluster);
+            }
+            else
+            {
+                rows.Add([cluster]);
+            }
+        }
+
+        foreach (var row in rows)
+        {
+            row.Sort((left, right) => left.Cells[0].Rect.ToBoundingBox().L.CompareTo(right.Cells[0].Rect.ToBoundingBox().L));
+        }
+
+        return rows;
+    }
+
+    private static List<List<PdfTextCellDto>> GroupCellsIntoRows(List<PdfTextCellDto> cells)
+    {
+        var rows = new List<List<PdfTextCellDto>>();
+
+        foreach (var cell in cells
+            .OrderByDescending(item => item.Rect.ToBoundingBox().T)
+            .ThenBy(item => item.Rect.ToBoundingBox().L))
+        {
+            var box = cell.Rect.ToBoundingBox();
+            var centerY = (box.T + box.B) / 2;
+            var height = Math.Max(1.0, box.Height);
+
+            if (rows.Count == 0)
+            {
+                rows.Add([cell]);
+                continue;
+            }
+
+            var currentRow = rows[^1];
+            var rowCenterY = currentRow.Average(item =>
+            {
+                var rowBox = item.Rect.ToBoundingBox();
+                return (rowBox.T + rowBox.B) / 2;
+            });
+            var rowHeight = Math.Max(
+                1.0,
+                currentRow.Average(item => Math.Max(1.0, item.Rect.ToBoundingBox().Height)));
+            var tolerance = Math.Max(6.0, Math.Max(height, rowHeight) * 0.6);
+
+            if (Math.Abs(centerY - rowCenterY) <= tolerance)
+            {
+                currentRow.Add(cell);
+            }
+            else
+            {
+                rows.Add([cell]);
+            }
+        }
+
+        foreach (var row in rows)
+        {
+            row.Sort((left, right) => left.Rect.ToBoundingBox().L.CompareTo(right.Rect.ToBoundingBox().L));
+        }
+
+        return rows;
+    }
+
+    private static List<double> GetColumnCenters(List<PdfTextCellDto> cells)
+    {
+        var centers = new List<double>();
+
+        foreach (var center in cells
+            .Select(cell =>
+            {
+                var box = cell.Rect.ToBoundingBox();
+                return (box.L + box.R) / 2;
+            })
+            .OrderBy(value => value))
+        {
+            if (centers.Count == 0 || Math.Abs(center - centers[^1]) > 12.0)
+            {
+                centers.Add(center);
+            }
+        }
+
+        return centers;
+    }
+
+    private static List<double> GetRowCenters(List<PdfTextCellDto> cells)
+    {
+        var centers = new List<double>();
+
+        foreach (var center in cells
+            .Select(cell =>
+            {
+                var box = cell.Rect.ToBoundingBox();
+                return (box.T + box.B) / 2;
+            })
+            .OrderByDescending(value => value))
+        {
+            if (centers.Count == 0 || Math.Abs(center - centers[^1]) > 12.0)
+            {
+                centers.Add(center);
+            }
+        }
+
+        return centers;
+    }
+
+    private static LayoutCluster ExpandClusterToCells(LayoutCluster cluster)
+    {
+        if (cluster.Cells.Count == 0)
+        {
+            return cluster;
+        }
+
+        var l = cluster.Cells.Min(cell => cell.Rect.ToBoundingBox().L);
+        var t = cluster.Cells.Max(cell => cell.Rect.ToBoundingBox().T);
+        var r = cluster.Cells.Max(cell => cell.Rect.ToBoundingBox().R);
+        var b = cluster.Cells.Min(cell => cell.Rect.ToBoundingBox().B);
+
+        cluster.Bbox = new BoundingBox(
+            Math.Min(cluster.Bbox.L, l),
+            Math.Min(cluster.Bbox.B, b),
+            Math.Max(cluster.Bbox.R, r),
+            Math.Max(cluster.Bbox.T, t));
+
+        return cluster;
+    }
+
+    private static BoundingBox GetBoundingBox(IReadOnlyList<PdfTextCellDto> cells)
+    {
+        var l = cells.Min(cell => cell.Rect.ToBoundingBox().L);
+        var t = cells.Max(cell => cell.Rect.ToBoundingBox().T);
+        var r = cells.Max(cell => cell.Rect.ToBoundingBox().R);
+        var b = cells.Min(cell => cell.Rect.ToBoundingBox().B);
+
+        return new BoundingBox(l, b, r, t);
     }
 
     private List<LayoutCluster> AdjustClusterBboxes(List<LayoutCluster> clusters)

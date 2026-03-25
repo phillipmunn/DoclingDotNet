@@ -41,6 +41,12 @@ public sealed class SegmentedPdfPageDto
     [JsonPropertyName("shapes")]
     public List<PdfShapeDto> Shapes { get; set; } = [];
 
+    [JsonPropertyName("predictions")]
+    public DoclingPagePredictions Predictions { get; set; } = new();
+
+    [JsonPropertyName("assembled")]
+    public AssembledUnit? Assembled { get; set; }
+
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? ExtensionData { get; set; }
 }

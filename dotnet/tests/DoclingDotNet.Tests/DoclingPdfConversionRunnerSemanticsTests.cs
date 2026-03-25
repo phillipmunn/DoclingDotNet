@@ -1,4 +1,6 @@
 using System.Text.Json;
+using DoclingDotNet.Algorithms.Layout;
+using DoclingDotNet.Layout;
 using DoclingDotNet.Models;
 using DoclingDotNet.Parsing;
 using DoclingDotNet.Ocr;
@@ -804,6 +806,85 @@ public sealed class DoclingPdfConversionRunnerSemanticsTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_WhenLayoutPostprocessingRuns_UsesOnlyPreferredTextlineCells()
+    {
+        var page = new SegmentedPdfPageDto
+        {
+            Dimension = new PdfPageGeometryDto
+            {
+                Angle = 0,
+                Rect = new BoundingRectangleDto
+                {
+                    RX0 = 0,
+                    RY0 = 0,
+                    RX1 = 200,
+                    RY1 = 0,
+                    RX2 = 200,
+                    RY2 = 200,
+                    RX3 = 0,
+                    RY3 = 200,
+                    CoordOrigin = "BOTTOMLEFT"
+                }
+            },
+            CharCells = [CreateCell(1, "A")],
+            WordCells = [CreateCell(2, "Alpha")],
+            TextlineCells = [CreateCell(3, "Alpha Line")],
+            HasChars = true,
+            HasWords = true,
+            HasLines = true
+        };
+
+        var fake = new FakeParseSession
+        {
+            PageCount = 1,
+            PageFactory = _ => page
+        };
+
+        var layoutProvider = new FakeLayoutProvider(
+            "fake-layout",
+            priority: 0,
+            isAvailable: true,
+            _ => LayoutProcessResult.Succeeded(new Dictionary<int, IReadOnlyList<LayoutCluster>>
+            {
+                [0] =
+                [
+                    new LayoutCluster
+                    {
+                        Id = 1,
+                        Label = "text",
+                        Confidence = 0.99,
+                        Bbox = new DoclingDotNet.Algorithms.Spatial.BoundingBox(0, 0, 100, 20)
+                    }
+                ]
+            }));
+
+        var runner = new DoclingPdfConversionRunner(
+            sessionFactory: _ => fake,
+            layoutProviders: [layoutProvider],
+            includeDefaultLayoutProviders: false);
+
+        var result = await runner.ExecuteAsync(new PdfConversionRequest
+        {
+            FilePath = "input.pdf",
+            RunId = "run-layout-cells",
+            EnableLayoutInference = true,
+            Timeout = TimeSpan.FromSeconds(2)
+        });
+
+        Assert.Equal(PipelineRunStatus.Succeeded, result.Pipeline.Status);
+        Assert.True(result.LayoutInferenceApplied);
+        Assert.True(result.LayoutPostprocessingApplied);
+
+        var cluster = Assert.Single(Assert.Single(result.Pages).Predictions.Layout!.Clusters);
+        var assignedCell = Assert.Single(cluster.Cells);
+        Assert.Equal("Alpha Line", assignedCell.Text);
+        Assert.Single(result.Pages[0].TextlineCells);
+        Assert.Equal("Alpha Line", result.Pages[0].TextlineCells[0].Text);
+        Assert.Single(result.Pages[0].WordCells);
+        Assert.Single(result.Pages[0].CharCells);
+    }
+
+    [Fact]
     public async Task ExecuteBatchAsync_WhenContinueOnDocumentFailureIsFalse_SkipsRemainingDocuments()
     {
         var first = new FakeParseSession
@@ -1067,6 +1148,51 @@ public sealed class DoclingPdfConversionRunnerSemanticsTests
         }
     }
 
+    private sealed class FakeLayoutProvider : IDoclingLayoutProvider
+    {
+        private readonly Func<LayoutProcessRequest, LayoutProcessResult> _process;
+
+        public FakeLayoutProvider(
+            string name,
+            int priority,
+            bool isAvailable,
+            Func<LayoutProcessRequest, LayoutProcessResult> process,
+            bool isTrusted = true,
+            bool isExternal = false)
+        {
+            Name = name;
+            Priority = priority;
+            _process = process;
+            IsProviderAvailable = isAvailable;
+            Capabilities = new LayoutProviderCapabilities
+            {
+                IsTrusted = isTrusted,
+                IsExternal = isExternal
+            };
+        }
+
+        public string Name { get; }
+
+        public int Priority { get; }
+
+        public LayoutProviderCapabilities Capabilities { get; }
+
+        private bool IsProviderAvailable { get; }
+
+        public bool IsAvailable()
+        {
+            return IsProviderAvailable;
+        }
+
+        public Task<LayoutProcessResult> ProcessAsync(
+            LayoutProcessRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(_process(request));
+        }
+    }
+
     private sealed class FakeOcrProvider : IDoclingOcrProvider
     {
         private readonly Func<OcrProcessRequest, OcrProcessResult> _process;
@@ -1222,5 +1348,26 @@ public sealed class DoclingPdfConversionRunnerSemanticsTests
         {
             Disposed = true;
         }
+    }
+
+    private static PdfTextCellDto CreateCell(long index, string text)
+    {
+        return new PdfTextCellDto
+        {
+            Index = index,
+            Text = text,
+            Rect = new BoundingRectangleDto
+            {
+                RX0 = 0,
+                RY0 = 0,
+                RX1 = 100,
+                RY1 = 0,
+                RX2 = 100,
+                RY2 = 20,
+                RX3 = 0,
+                RY3 = 20,
+                CoordOrigin = "BOTTOMLEFT"
+            }
+        };
     }
 }

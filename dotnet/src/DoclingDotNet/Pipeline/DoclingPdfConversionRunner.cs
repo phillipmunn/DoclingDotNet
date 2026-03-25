@@ -18,6 +18,7 @@ public static class PdfConversionStageNames
     public const string ApplyOcrFallback = "apply_ocr_fallback";
     public const string ApplyLayoutInference = "apply_layout_inference";
     public const string ApplyLayoutPostprocessing = "apply_layout_postprocessing";
+    public const string ApplyPageAssemble = "apply_page_assemble";
     public const string ApplyReadingOrder = "apply_reading_order";
     public const string TransformPages = "transform_pages";
     public const string ExtractAnnotations = "extract_annotations";
@@ -189,6 +190,8 @@ public sealed class PdfConversionRunResult
     public string? LayoutProviderName { get; init; }
 
     public required bool LayoutPostprocessingApplied { get; init; }
+
+    public required bool PageAssembleApplied { get; init; }
 
     public required bool ReadingOrderApplied { get; init; }
 
@@ -363,6 +366,7 @@ public sealed class DoclingPdfConversionRunner
         var layoutInferenceApplied = false;
         string? layoutProviderName = null;
         var layoutPostprocessingApplied = false;
+        var pageAssembleApplied = false;
         var readingOrderApplied = false;
         string? annotationsJson = null;
         string? tableOfContentsJson = null;
@@ -404,7 +408,7 @@ public sealed class DoclingPdfConversionRunner
                                           {
                                               parseSession.LoadDocument(documentKey, request.FilePath!, request.Password);
                                           }
-                                          
+
                                           documentLoaded = true;
                                       }
                                   },                new()
@@ -707,7 +711,7 @@ public sealed class DoclingPdfConversionRunner
                                 layoutProviderName = provider.Name;
                                 return;
                             }
-                            
+
                             if (providerResult.Status == LayoutProcessStatus.FatalFailure)
                             {
                                 throw new InvalidOperationException($"Layout provider '{provider.Name}' failed: {providerResult.Message}");
@@ -732,8 +736,8 @@ public sealed class DoclingPdfConversionRunner
                         foreach (var page in pages)
                         {
                             token.ThrowIfCancellationRequested();
-                            
-                            var cells = page.CharCells.Concat(page.WordCells).Concat(page.TextlineCells).ToList();
+
+                            var cells = SelectLayoutAssignmentCells(page);
                             if (cells.Count == 0) continue;
 
                             if (!pageClusters.TryGetValue((int)page.Dimension.Angle, out var clusters)) // mock fallback logic, typically would use page index
@@ -742,61 +746,94 @@ public sealed class DoclingPdfConversionRunner
                             }
 
                             var postprocessor = new LayoutPostprocessor(page.Dimension, cells, clusters, options);
-                            var (finalClusters, finalCells) = postprocessor.Postprocess();
-                            
-                            // Emitting output clusters is currently mocked. 
-                            // The true pipeline drops finalClusters into `page.Lines` or a similar property.
-                            page.TextlineCells = finalCells.ToList();
-                        }
-                        layoutPostprocessingApplied = true;
-                        return Task.CompletedTask;
-                    }
-                },
-                new()
-                {
-                    Name = PdfConversionStageNames.ApplyReadingOrder,
-                    ExecuteAsync = (_, token) =>
-                    {
-                        if (!layoutPostprocessingApplied) return Task.CompletedTask;
+                            var (finalClusters, _) = postprocessor.Postprocess();
 
-                        var predictor = new ReadingOrderPredictor();
-                        
-                        foreach (var page in pages)
+                            page.Predictions.Layout = new LayoutPrediction
+                            {
+                                Clusters = finalClusters.ToList()
+                            };
+                                }
+                                layoutPostprocessingApplied = true;
+                                return Task.CompletedTask;
+                            }
+                        },
+                        new()
                         {
-                            token.ThrowIfCancellationRequested();
-
-                            var elements = new List<PageElement>();
-                            int cid = 0;
-                            
-                            foreach (var cell in page.TextlineCells)
+                            Name = PdfConversionStageNames.ApplyPageAssemble,
+                            ExecuteAsync = (_, token) =>
                             {
-                                elements.Add(new PageElement
+                                if (!layoutPostprocessingApplied) return Task.CompletedTask;
+
+                                var pageAssembler = new DoclingDotNet.Algorithms.PageAssemble.PageAssembleModel();
+
+                                int pageNo = 1;
+                                foreach (var page in pages)
                                 {
-                                    Cid = cid++,
-                                    Bbox = cell.Rect.ToBoundingBox(),
-                                    Text = cell.Text,
-                                    PageNo = 1, // Mock
-                                    Label = "text",
-                                    PageWidth = page.Dimension.Rect.RX2,
-                                    PageHeight = page.Dimension.Rect.RY2
-                                });
-                            }
+                                    token.ThrowIfCancellationRequested();
+                                    pageAssembler.ParsePage(page, pageNo++);
+                                }
 
-                            var sortedElements = predictor.PredictReadingOrder(elements);
-                            var sortedCells = new List<PdfTextCellDto>(page.TextlineCells.Count);
-                            
-                            foreach (var elem in sortedElements)
+                                pageAssembleApplied = true;
+                                return Task.CompletedTask;
+                            }
+                        },
+                        new()
+                        {
+                            Name = PdfConversionStageNames.ApplyReadingOrder,
+                            ExecuteAsync = (_, token) =>
                             {
-                                sortedCells.Add(page.TextlineCells[elem.Cid]);
+                                if (!pageAssembleApplied) return Task.CompletedTask;
+
+                                var predictor = new ReadingOrderPredictor();
+
+                                int pageNo = 1;
+                                foreach (var page in pages)
+                                {
+                                    token.ThrowIfCancellationRequested();
+                                    if (page.Assembled?.Elements is null)
+                                    {
+                                        pageNo++;
+                                        continue;
+                                    }
+
+                                    var elements = new List<PageElement>();
+                                    int cid = 0;
+
+                                    var pageHeight = page.Dimension.Rect.RY2;
+                                    var pageWidth = page.Dimension.Rect.RX2;
+
+                                    foreach (var element in page.Assembled.Elements)
+                                    {
+                                        var bbox = element.Cluster.Bbox;
+
+                                        elements.Add(new PageElement
+                                        {
+                                            Cid = cid++,
+                                            Bbox = bbox,
+                                            Text = element.Text ?? string.Empty,
+                                            PageNo = pageNo,
+                                            Label = element.Label,
+                                            PageWidth = pageWidth,
+                                            PageHeight = pageHeight
+                                        });
+                                    }
+
+                                    var sortedElements = predictor.PredictReadingOrder(elements);
+                                    var sortedAssembledElements = new List<BasePageElement>(page.Assembled.Elements.Count);
+
+                                    foreach (var elem in sortedElements)
+                                    {
+                                        sortedAssembledElements.Add(page.Assembled.Elements[elem.Cid]);
+                                    }
+
+                                    page.Assembled.Elements = sortedAssembledElements;
+                                    pageNo++;
+                                }
+
+                                readingOrderApplied = true;
+                                return Task.CompletedTask;
                             }
-
-                            page.TextlineCells = sortedCells;
-                        }
-
-                        readingOrderApplied = true;
-                        return Task.CompletedTask;
-                    }
-                },
+                        },
                 new()
                 {
                     Name = PdfConversionStageNames.TransformPages,
@@ -963,6 +1000,7 @@ public sealed class DoclingPdfConversionRunner
                 LayoutInferenceApplied = layoutInferenceApplied,
                 LayoutProviderName = layoutProviderName,
                 LayoutPostprocessingApplied = layoutPostprocessingApplied,
+                PageAssembleApplied = pageAssembleApplied,
                 ReadingOrderApplied = readingOrderApplied,
                 AnnotationsJson = annotationsJson,
                 TableOfContentsJson = tableOfContentsJson,
@@ -1109,6 +1147,21 @@ public sealed class DoclingPdfConversionRunner
             Aggregation = aggregation,
             PersistedArtifactDirectory = persistedArtifactDirectory
         };
+    }
+
+    private static List<PdfTextCellDto> SelectLayoutAssignmentCells(SegmentedPdfPageDto page)
+    {
+        if (page.TextlineCells.Count > 0)
+        {
+            return page.TextlineCells.ToList();
+        }
+
+        if (page.WordCells.Count > 0)
+        {
+            return page.WordCells.ToList();
+        }
+
+        return page.CharCells.ToList();
     }
 
     private static IReadOnlyList<IDoclingOcrProvider> BuildConfiguredOcrProviders(
