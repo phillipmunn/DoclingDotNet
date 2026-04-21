@@ -15,14 +15,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="bblanchon.PDFium.Linux" Version="135.0.7024" />
-    <PackageReference Include="bblanchon.PDFium.macOS" Version="135.0.7024" />
-    <PackageReference Include="bblanchon.PDFium.Win32" Version="135.0.7024" />
-    <PackageReference Include="DocumentFormat.OpenXml" Version="3.0.2" />
+    <PackageReference Include="bblanchon.PDFium.Linux" Version="149.0.7802" />
+    <PackageReference Include="bblanchon.PDFium.macOS" Version="149.0.7802" />
+    <PackageReference Include="bblanchon.PDFium.Win32" Version="149.0.7802" />
+    <PackageReference Include="DocumentFormat.OpenXml" Version="3.5.1" />
     <PackageReference Include="FFMpegCore" Version="5.4.0" />
-    <PackageReference Include="HtmlAgilityPack" Version="1.11.61" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.24.2" />
-    <PackageReference Include="MimeKit" Version="4.15.1" />
+    <PackageReference Include="HtmlAgilityPack" Version="1.12.4" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.24.4" />
+    <PackageReference Include="MimeKit" Version="4.16.0" />
     <PackageReference Include="SkiaSharp" Version="2.88.8" />
     <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.8" />
     <PackageReference Include="Tesseract" Version="5.2.0" />
@@ -35,7 +35,7 @@
     <DoclingParseBuildDir>$(DoclingParseRoot)\build-cabi\$(Configuration)</DoclingParseBuildDir>
     <DoclingParseCDll>$(DoclingParseBuildDir)\docling_parse_c.dll</DoclingParseCDll>
     <PdfResourcesDir>$(DoclingParseRoot)\docling_parse\pdf_resources</PdfResourcesDir>
-    <Version>1.3.2-internal</Version>
+    <Version>1.3.3-internal</Version>
   </PropertyGroup>
 
   <ItemGroup>
