@@ -7,6 +7,16 @@ namespace DoclingDotNet.Export;
 
 public static class TextExporter
 {
+    private sealed record SyntheticTextTable(
+        int AnchorIndex,
+        HashSet<int> CoveredIndices,
+        IReadOnlyList<PdfTextCellDto> Cells);
+
+    private sealed record SyntheticTextTableCandidate(
+        int ElementIndex,
+        PdfTextCellDto Cell,
+        BoundingBox Box);
+
     public static string Export(PdfConversionRunResult result)
     {
         var sb = new StringBuilder();
@@ -15,8 +25,24 @@ public static class TextExporter
         {
             if (page.Assembled?.Elements != null)
             {
+                var syntheticTables = DetectSyntheticTextTables(page.Assembled.Elements);
+                var syntheticTableIndices = syntheticTables.Values
+                    .SelectMany(table => table.CoveredIndices)
+                    .ToHashSet();
+
                 for (int i = 0; i < page.Assembled.Elements.Count; i++)
                 {
+                    if (syntheticTables.TryGetValue(i, out var syntheticTable))
+                    {
+                        ExportTableCells(syntheticTable.Cells, sb);
+                        continue;
+                    }
+
+                    if (syntheticTableIndices.Contains(i))
+                    {
+                        continue;
+                    }
+
                     var element = page.Assembled.Elements[i];
                     if (element is TableElement tableElement)
                     {
@@ -74,6 +100,16 @@ public static class TextExporter
                     tableCells.Add(supplementalCell);
                 }
             }
+        }
+
+        ExportTableCells(tableCells, sb);
+    }
+
+    private static void ExportTableCells(IReadOnlyList<PdfTextCellDto> tableCells, StringBuilder sb)
+    {
+        if (tableCells.Count == 0)
+        {
+            return;
         }
 
         var cellBoxes = tableCells
@@ -197,6 +233,166 @@ public static class TextExporter
                 sb.AppendLine();
             }
         }
+    }
+
+    private static Dictionary<int, SyntheticTextTable> DetectSyntheticTextTables(IReadOnlyList<BasePageElement> elements)
+    {
+        var candidates = elements
+            .Select((element, index) => new { element, index })
+            .Where(item => item.element is TextElement
+                           && item.element.Cluster.Cells.Count == 1
+                           && !string.IsNullOrWhiteSpace(item.element.Text)
+                           && !ShouldDeferToUpcomingTable(elements, item.index))
+            .Select(item =>
+            {
+                var cell = item.element.Cluster.Cells[0];
+                return new SyntheticTextTableCandidate(item.index, cell, cell.Rect.ToBoundingBox());
+            })
+            .OrderByDescending(item => item.Box.T)
+            .ThenBy(item => item.Box.L)
+            .ToList();
+
+        if (candidates.Count == 0)
+        {
+            return [];
+        }
+
+        var rows = new List<List<SyntheticTextTableCandidate>>();
+        foreach (var candidate in candidates)
+        {
+            if (rows.Count == 0)
+            {
+                rows.Add([candidate]);
+                continue;
+            }
+
+            var currentRow = rows[^1];
+            var rowCenterY = currentRow.Average(item => (item.Box.T + item.Box.B) / 2);
+            var rowHeight = Math.Max(1.0, currentRow.Average(item => item.Box.T - item.Box.B));
+            var tolerance = Math.Max(10.0, Math.Max(candidate.Box.Height, rowHeight) * 0.8);
+            var centerY = (candidate.Box.T + candidate.Box.B) / 2;
+
+            if (Math.Abs(centerY - rowCenterY) <= tolerance)
+            {
+                currentRow.Add(candidate);
+            }
+            else
+            {
+                rows.Add([candidate]);
+            }
+        }
+
+        foreach (var row in rows)
+        {
+            row.Sort((left, right) => left.Box.L.CompareTo(right.Box.L));
+        }
+
+        var usedIndices = new HashSet<int>();
+        var tables = new Dictionary<int, SyntheticTextTable>();
+
+        for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+        {
+            var headerRow = rows[rowIndex]
+                .Where(candidate => !usedIndices.Contains(candidate.ElementIndex))
+                .ToList();
+            if (headerRow.Count < 3)
+            {
+                continue;
+            }
+
+            var columnCenters = GetColumnCenters(headerRow.Select(candidate => candidate.Cell));
+            if (columnCenters.Count < 3)
+            {
+                continue;
+            }
+
+            var averageHeaderHeight = Math.Max(1.0, headerRow.Average(candidate => candidate.Box.Height));
+            var horizontalTolerance = Math.Max(12.0, averageHeaderHeight * 1.5);
+            var verticalGapLimit = Math.Max(60.0, averageHeaderHeight * 6.0);
+            var tableCandidates = new List<SyntheticTextTableCandidate>(headerRow);
+            var currentBottom = headerRow.Min(candidate => candidate.Box.B);
+
+            for (int candidateRowIndex = rowIndex + 1; candidateRowIndex < rows.Count; candidateRowIndex++)
+            {
+                var candidateRow = rows[candidateRowIndex]
+                    .Where(candidate => !usedIndices.Contains(candidate.ElementIndex))
+                    .ToList();
+                if (candidateRow.Count == 0)
+                {
+                    continue;
+                }
+
+                var rowTop = candidateRow.Max(candidate => candidate.Box.T);
+                if (currentBottom - rowTop > verticalGapLimit)
+                {
+                    break;
+                }
+
+                var alignedCells = candidateRow.Count(candidate =>
+                {
+                    var centerX = (candidate.Box.L + candidate.Box.R) / 2;
+                    return columnCenters.Any(columnCenter => Math.Abs(columnCenter - centerX) <= horizontalTolerance);
+                });
+
+                if (alignedCells >= 1)
+                {
+                    tableCandidates.AddRange(candidateRow);
+                    currentBottom = candidateRow.Min(candidate => candidate.Box.B);
+                }
+            }
+
+            var dataCandidates = tableCandidates
+                .Where(candidate => !headerRow.Contains(candidate))
+                .ToList();
+            var alignedDataCells = dataCandidates.Count(candidate =>
+            {
+                var centerX = (candidate.Box.L + candidate.Box.R) / 2;
+                return columnCenters.Any(columnCenter => Math.Abs(columnCenter - centerX) <= horizontalTolerance);
+            });
+            if (alignedDataCells < 2)
+            {
+                continue;
+            }
+
+            var anchorIndex = tableCandidates.Min(candidate => candidate.ElementIndex);
+            var coveredIndices = tableCandidates
+                .Select(candidate => candidate.ElementIndex)
+                .ToHashSet();
+            var tableCells = tableCandidates
+                .Select(candidate => candidate.Cell)
+                .DistinctBy(cell => cell.Index)
+                .OrderBy(cell => cell.Index)
+                .ToList();
+
+            tables[anchorIndex] = new SyntheticTextTable(anchorIndex, coveredIndices, tableCells);
+            foreach (var coveredIndex in coveredIndices)
+            {
+                usedIndices.Add(coveredIndex);
+            }
+        }
+
+        return tables;
+    }
+
+    private static List<double> GetColumnCenters(IEnumerable<PdfTextCellDto> cells)
+    {
+        var centers = new List<double>();
+
+        foreach (var center in cells
+            .Select(cell =>
+            {
+                var box = cell.Rect.ToBoundingBox();
+                return (box.L + box.R) / 2;
+            })
+            .OrderBy(value => value))
+        {
+            if (centers.Count == 0 || Math.Abs(center - centers[^1]) > 12.0)
+            {
+                centers.Add(center);
+            }
+        }
+
+        return centers;
     }
 
     private static bool ShouldDeferToUpcomingTable(IReadOnlyList<BasePageElement> elements, int index)

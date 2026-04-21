@@ -112,12 +112,16 @@ public sealed class LayoutPostprocessor
             {
                 foreach (var child in wrapper.Children)
                 {
-                    containedIds.Add(child.Id);
+                    if (ShouldSuppressChildClusters(wrapper.Label))
+                    {
+                        containedIds.Add(child.Id);
+                    }
                 }
             }
         }
 
         _regularClusters.RemoveAll(c => containedIds.Contains(c.Id));
+        PromoteAlignedTextRowsToTables();
         _regularClusters = SplitMultiRowListItemClusters(_regularClusters);
 
         var finalClusters = SortClusters(_regularClusters.Concat(_specialClusters).ToList(), "id");
@@ -326,7 +330,12 @@ public sealed class LayoutPostprocessor
                     return columnCenters.Any(columnCenter => Math.Abs(columnCenter - centerX) <= horizontalTolerance);
                 });
 
-                if (alignedCells < Math.Min(2, columnCenters.Count))
+                var candidateColumnCount = GetColumnCenters(row.Select(c => c.Cells[0]).ToList()).Count;
+                var requiredAligned = candidateColumnCount > columnCenters.Count
+                    ? (int)Math.Ceiling(row.Count * 0.75)
+                    : Math.Min(2, columnCenters.Count);
+
+                if (alignedCells < requiredAligned)
                 {
                     continue;
                 }
@@ -441,9 +450,212 @@ public sealed class LayoutPostprocessor
         pictureClusters = RemoveOverlappingClusters(pictureClusters, "picture");
 
         var wrapperClusters = specialClusters.Where(c => WrapperTypes.Contains(c.Label)).ToList();
+        wrapperClusters = wrapperClusters
+            .Where(cluster => cluster.Label != "table" || LooksLikeTable(cluster.Cells))
+            .ToList();
         wrapperClusters = RemoveOverlappingClusters(wrapperClusters, "wrapper");
 
         return pictureClusters.Concat(wrapperClusters).ToList();
+    }
+
+    private static bool ShouldSuppressChildClusters(string label)
+    {
+        return !string.Equals(label, "form", StringComparison.OrdinalIgnoreCase)
+               && !string.Equals(label, "key_value_region", StringComparison.OrdinalIgnoreCase)
+               && !string.Equals(label, "document_index", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void PromoteAlignedTextRowsToTables()
+    {
+        var singleCellTextClusters = _regularClusters
+            .Where(cluster => string.Equals(cluster.Label, "text", StringComparison.OrdinalIgnoreCase) && cluster.Cells.Count == 1)
+            .ToList();
+
+        if (singleCellTextClusters.Count == 0)
+        {
+            return;
+        }
+
+        var rows = GroupSingleCellTextClustersIntoRows(singleCellTextClusters);
+        var usedClusterIds = new HashSet<int>();
+        var syntheticTables = new List<LayoutCluster>();
+        var nextId = Math.Max(
+            _allClusters.Count > 0 ? _allClusters.Max(cluster => cluster.Id) : 0,
+            _regularClusters.Count > 0 ? _regularClusters.Max(cluster => cluster.Id) : 0) + 1;
+
+        for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+        {
+            var row = rows[rowIndex];
+            var headerRow = row.Where(cluster => !usedClusterIds.Contains(cluster.Id)).ToList();
+            if (headerRow.Count < 3)
+            {
+                continue;
+            }
+
+            var headerCells = headerRow.Select(cluster => cluster.Cells[0]).ToList();
+            var columnCenters = GetColumnCenters(headerCells);
+            if (columnCenters.Count < 3)
+            {
+                continue;
+            }
+
+            var averageHeaderHeight = Math.Max(
+                1.0,
+                headerCells.Average(cell => Math.Max(1.0, cell.Rect.ToBoundingBox().Height)));
+            var horizontalTolerance = Math.Max(12.0, averageHeaderHeight * 1.5);
+            var verticalGapLimit = Math.Max(60.0, averageHeaderHeight * 6.0);
+
+            var tableClusters = new List<LayoutCluster>(headerRow);
+            var currentBottom = headerCells.Min(cell => cell.Rect.ToBoundingBox().B);
+            var headerRowFound = false;
+
+            for (int candidateRowIndex = rowIndex + 1; candidateRowIndex < rows.Count; candidateRowIndex++)
+            {
+                var candidateRow = rows[candidateRowIndex];
+                var availableClusters = candidateRow.Where(cluster => !usedClusterIds.Contains(cluster.Id)).ToList();
+                if (availableClusters.Count == 0)
+                {
+                    continue;
+                }
+
+                var rowTop = availableClusters.Max(cluster => cluster.Cells[0].Rect.ToBoundingBox().T);
+                if (currentBottom - rowTop > verticalGapLimit)
+                {
+                    break;
+                }
+
+                var logicalRowClusters = new List<LayoutCluster>(availableClusters);
+                var logicalRowBottom = availableClusters.Min(cluster => cluster.Cells[0].Rect.ToBoundingBox().B);
+                while (candidateRowIndex + 1 < rows.Count)
+                {
+                    var nextRowClusters = rows[candidateRowIndex + 1]
+                        .Where(cluster => !usedClusterIds.Contains(cluster.Id))
+                        .ToList();
+                    if (nextRowClusters.Count == 0)
+                    {
+                        candidateRowIndex++;
+                        continue;
+                    }
+
+                    var nextRowTop = nextRowClusters.Max(cluster => cluster.Cells[0].Rect.ToBoundingBox().T);
+                    if (logicalRowBottom - nextRowTop > horizontalTolerance)
+                    {
+                        break;
+                    }
+
+                    logicalRowClusters.AddRange(nextRowClusters);
+                    logicalRowBottom = nextRowClusters.Min(cluster => cluster.Cells[0].Rect.ToBoundingBox().B);
+                    candidateRowIndex++;
+                }
+
+                var alignedCells = logicalRowClusters.Count(cluster =>
+                {
+                    var box = cluster.Cells[0].Rect.ToBoundingBox();
+                    var centerX = (box.L + box.R) / 2;
+                    return columnCenters.Any(columnCenter => Math.Abs(columnCenter - centerX) <= horizontalTolerance);
+                });
+
+                var candidateColumnCount = GetColumnCenters(logicalRowClusters.Select(c => c.Cells[0]).ToList()).Count;
+                var requiredAligned = candidateColumnCount > columnCenters.Count
+                    ? (int)Math.Ceiling(logicalRowClusters.Count * 0.75)
+                    : 2;
+
+                if (alignedCells >= requiredAligned)
+                {
+                    tableClusters.AddRange(logicalRowClusters);
+                    currentBottom = logicalRowClusters.Min(cluster => cluster.Cells[0].Rect.ToBoundingBox().B);
+                    headerRowFound = true;
+                    continue;
+                }
+
+                if (headerRowFound)
+                {
+                    break;
+                }
+            }
+
+            if (!headerRowFound)
+            {
+                continue;
+            }
+
+            var cells = tableClusters.Select(cluster => cluster.Cells[0]).ToList();
+            if (!LooksLikeTable(cells))
+            {
+                continue;
+            }
+
+            var deduplicatedCells = SortCells(DeduplicateCells(cells));
+            syntheticTables.Add(new LayoutCluster
+            {
+                Id = nextId++,
+                Label = "table",
+                Confidence = tableClusters.Average(cluster => cluster.Confidence),
+                Bbox = GetBoundingBox(deduplicatedCells),
+                Cells = deduplicatedCells
+            });
+
+            foreach (var cluster in tableClusters)
+            {
+                usedClusterIds.Add(cluster.Id);
+            }
+        }
+
+        if (syntheticTables.Count == 0)
+        {
+            return;
+        }
+
+        _regularClusters = _regularClusters
+            .Where(cluster => !usedClusterIds.Contains(cluster.Id))
+            .ToList();
+        _specialClusters.AddRange(syntheticTables);
+    }
+
+    private static bool LooksLikeTable(IReadOnlyList<PdfTextCellDto> cells)
+    {
+        if (cells.Count < 4)
+        {
+            return false;
+        }
+
+        var rows = GroupCellsIntoRows(cells.ToList());
+        if (rows.Count < 2)
+        {
+            return false;
+        }
+
+        var anchorRow = rows
+            .OrderByDescending(row => row.Count)
+            .ThenBy(row => rows.IndexOf(row))
+            .First();
+        if (anchorRow.Count < 3)
+        {
+            return false;
+        }
+
+        var columnCenters = GetColumnCenters(anchorRow);
+        if (columnCenters.Count < 3)
+        {
+            return false;
+        }
+
+        var averageCellHeight = Math.Max(
+            1.0,
+            anchorRow.Average(cell => Math.Max(1.0, cell.Rect.ToBoundingBox().Height)));
+        var horizontalTolerance = Math.Max(12.0, averageCellHeight * 1.5);
+
+        var alignedDataCells = rows
+            .Where(row => !ReferenceEquals(row, anchorRow))
+            .SelectMany(row => row)
+            .Count(cell =>
+            {
+                var box = cell.Rect.ToBoundingBox();
+                var centerX = (box.L + box.R) / 2;
+                return columnCenters.Any(columnCenter => Math.Abs(columnCenter - centerX) <= horizontalTolerance);
+            });
+
+        return alignedDataCells >= 2;
     }
 
     private List<LayoutCluster> HandleCrossTypeOverlaps(List<LayoutCluster> specialClusters)
