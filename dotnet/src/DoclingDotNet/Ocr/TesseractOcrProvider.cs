@@ -89,46 +89,49 @@ public sealed class TesseractOcrProvider : IDoclingOcrProvider
 
         try
         {
-            using var engine = new TesseractEngine(_options.DataPath, language, _options.EngineMode);
-            var updatedPages = request.Pages.Select(ClonePage).ToList();
-            var hasChanges = false;
-
-            for (var pageIndex = 0; pageIndex < updatedPages.Count; pageIndex++)
+            return await Task.Run(() =>
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (!_options.InjectWordsWhenMissing || updatedPages[pageIndex].WordCells.Count > 0)
+                using var engine = new TesseractEngine(_options.DataPath, language, _options.EngineMode);
+                var updatedPages = request.Pages.Select(ClonePage).ToList();
+                var hasChanges = false;
+
+                for (var pageIndex = 0; pageIndex < updatedPages.Count; pageIndex++)
                 {
-                    continue;
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!_options.InjectWordsWhenMissing || updatedPages[pageIndex].WordCells.Count > 0)
+                    {
+                        continue;
+                    }
+
+                    var imagePath = ResolveBestImagePath(updatedPages[pageIndex], request.FilePath);
+                    if (imagePath is null)
+                    {
+                        continue;
+                    }
+
+                    using var pix = Pix.LoadFromFile(imagePath);
+                    using var page = engine.Process(pix);
+                    var text = page.GetText()?.Trim();
+                    if (string.IsNullOrWhiteSpace(text))
+                    {
+                        continue;
+                    }
+
+                    var syntheticCell = BuildSyntheticOcrWordCell(updatedPages[pageIndex], text, page.GetMeanConfidence());
+                    updatedPages[pageIndex].WordCells.Add(syntheticCell);
+                    updatedPages[pageIndex].HasWords = true;
+                    hasChanges = true;
                 }
 
-                var imagePath = ResolveBestImagePath(updatedPages[pageIndex], request.FilePath);
-                if (imagePath is null)
+                if (hasChanges)
                 {
-                    continue;
+                    return OcrProcessResult.Succeeded(
+                        updatedPages,
+                        "Tesseract OCR fallback applied.");
                 }
 
-                using var pix = Pix.LoadFromFile(imagePath);
-                using var page = engine.Process(pix);
-                var text = page.GetText()?.Trim();
-                if (string.IsNullOrWhiteSpace(text))
-                {
-                    continue;
-                }
-
-                var syntheticCell = BuildSyntheticOcrWordCell(updatedPages[pageIndex], text, page.GetMeanConfidence());
-                updatedPages[pageIndex].WordCells.Add(syntheticCell);
-                updatedPages[pageIndex].HasWords = true;
-                hasChanges = true;
-            }
-
-            if (hasChanges)
-            {
-                return OcrProcessResult.Succeeded(
-                    updatedPages,
-                    "Tesseract OCR fallback applied.");
-            }
-
-            return OcrProcessResult.NoChanges("No OCR-compatible page images were found.");
+                return OcrProcessResult.NoChanges("No OCR-compatible page images were found.");
+            }, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
