@@ -52,7 +52,13 @@ public sealed class OnnxLayoutProvider : IDoclingLayoutProvider, IDisposable
             }
             
             PdfiumNative.FPDF_InitLibrary();
-            var sessionOptions = new SessionOptions();
+            var sessionOptions = new SessionOptions
+            {
+                GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
+                ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
+                InterOpNumThreads = 1,
+                IntraOpNumThreads = Math.Max(1, Environment.ProcessorCount / 2)
+            };
             _session = new InferenceSession(_modelPath, sessionOptions);
             _initialized = true;
         }
@@ -120,8 +126,14 @@ public sealed class OnnxLayoutProvider : IDoclingLayoutProvider, IDisposable
                         var width = PdfiumNative.FPDF_GetPageWidth(page);
                         var height = PdfiumNative.FPDF_GetPageHeight(page);
 
-                        int pxWidth = (int)Math.Ceiling(width);
-                        int pxHeight = (int)Math.Ceiling(height);
+                        // Rendering at native resolution (e.g. 2480×3508 for A4@300dpi) is wasteful
+                        // because the image is immediately resized to 640×640 for inference.
+                        // Cap the raster size to 960px on the longest side to cut rendering work
+                        // significantly while still providing enough detail for the model.
+                        const int maxRenderPx = 960;
+                        float scale = Math.Min(1f, maxRenderPx / (float)Math.Max(width, height));
+                        int pxWidth = Math.Max(1, (int)Math.Ceiling(width * scale));
+                        int pxHeight = Math.Max(1, (int)Math.Ceiling(height * scale));
 
                         using var bitmap = new SKBitmap(pxWidth, pxHeight, SKColorType.Bgra8888, SKAlphaType.Premul);
                         var fpdfBitmap = PdfiumNative.FPDFBitmap_CreateEx(pxWidth, pxHeight, 4, bitmap.GetPixels(), bitmap.RowBytes);
@@ -140,8 +152,8 @@ public sealed class OnnxLayoutProvider : IDoclingLayoutProvider, IDisposable
                         var tensor = CreateNormalizedTensor(resized);
 
                         var targetSizesTensor = new DenseTensor<long>(new[] { 1, 2 });
-                        targetSizesTensor[0, 0] = pxHeight; // RT-DETR expects [height, width]
-                        targetSizesTensor[0, 1] = pxWidth;
+                        targetSizesTensor[0, 0] = (long)Math.Ceiling(height); // RT-DETR expects [height, width]
+                        targetSizesTensor[0, 1] = (long)Math.Ceiling(width);
 
                         var inputs = new List<NamedOnnxValue>
                         {
@@ -220,14 +232,18 @@ public sealed class OnnxLayoutProvider : IDoclingLayoutProvider, IDisposable
     private static DenseTensor<float> CreateNormalizedTensor(SKBitmap bitmap)
     {
         var tensor = new DenseTensor<float>(new[] { 1, 3, 640, 640 });
-        
-        const float scale = 1f / 255f;
-        float meanR = 0.485f, meanG = 0.456f, meanB = 0.406f;
-        float stdR = 0.229f, stdG = 0.224f, stdB = 0.225f;
 
-        int width = 640;
-        int height = 640;
-        int channelStride = width * height;
+        // Pre-compute per-channel fused constants so the inner loop only needs
+        // multiply + subtract instead of two divisions per pixel per channel:
+        //   (pixel / 255 - mean) / std  ==  pixel * invStd255 - bias
+        const float inv255 = 1f / 255f;
+        float invStdR = inv255 / 0.229f, biasR = 0.485f / 0.229f;
+        float invStdG = inv255 / 0.224f, biasG = 0.456f / 0.224f;
+        float invStdB = inv255 / 0.225f, biasB = 0.406f / 0.225f;
+
+        const int width = 640;
+        const int height = 640;
+        const int channelStride = width * height;
 
         unsafe
         {
@@ -240,17 +256,17 @@ public sealed class OnnxLayoutProvider : IDoclingLayoutProvider, IDisposable
                 for (int x = 0; x < width; x++)
                 {
                     int srcIdx = (rowOffset + x) * 4;
-                    
+
                     // SKColorType.Bgra8888 format
                     byte b = srcPtr[srcIdx];
                     byte g = srcPtr[srcIdx + 1];
                     byte r = srcPtr[srcIdx + 2];
 
                     int pixelIdx = rowOffset + x;
-                    
-                    destSpan[0 * channelStride + pixelIdx] = ((r * scale) - meanR) / stdR;
-                    destSpan[1 * channelStride + pixelIdx] = ((g * scale) - meanG) / stdG;
-                    destSpan[2 * channelStride + pixelIdx] = ((b * scale) - meanB) / stdB;
+
+                    destSpan[0 * channelStride + pixelIdx] = r * invStdR - biasR;
+                    destSpan[1 * channelStride + pixelIdx] = g * invStdG - biasG;
+                    destSpan[2 * channelStride + pixelIdx] = b * invStdB - biasB;
                 }
             }
         }
