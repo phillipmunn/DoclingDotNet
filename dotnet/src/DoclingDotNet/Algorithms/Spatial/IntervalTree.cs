@@ -27,6 +27,28 @@ public sealed class IntervalTree
         _intervals.Insert(index, interval);
     }
 
+    public HashSet<int> FindOverlapping(double queryMin, double queryMax)
+    {
+        var result = new HashSet<int>();
+
+        // Binary-search for the first interval whose MinVal >= queryMax.
+        // Every interval before that position has MinVal < queryMax and is a candidate
+        // if its MaxVal > queryMin (i.e. it overlaps [queryMin, queryMax)).
+        var sentinel = new Interval(queryMax, queryMax, 0);
+        var pos = _intervals.BinarySearch(sentinel);
+        if (pos < 0) pos = ~pos;
+
+        for (int i = 0; i < pos; i++)
+        {
+            if (_intervals[i].MaxVal > queryMin)
+            {
+                result.Add(_intervals[i].Id);
+            }
+        }
+
+        return result;
+    }
+
     public HashSet<int> FindContaining(double point)
     {
         var result = new HashSet<int>();
