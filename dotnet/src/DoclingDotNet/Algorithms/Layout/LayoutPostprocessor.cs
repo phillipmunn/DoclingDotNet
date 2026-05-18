@@ -79,6 +79,7 @@ public sealed class LayoutPostprocessor
     private readonly SpatialClusterIndex _regularIndex;
     private readonly SpatialClusterIndex _pictureIndex;
     private readonly SpatialClusterIndex _wrapperIndex;
+    private readonly int _maxClusterId;
 
     public LayoutPostprocessor(
         PdfPageGeometryDto pageSize,
@@ -97,6 +98,7 @@ public sealed class LayoutPostprocessor
         _regularIndex = new SpatialClusterIndex(_regularClusters);
         _pictureIndex = new SpatialClusterIndex(_specialClusters.Where(c => c.Label == "picture"));
         _wrapperIndex = new SpatialClusterIndex(_specialClusters.Where(c => WrapperTypes.Contains(c.Label)));
+        _maxClusterId = _allClusters.Count > 0 ? _allClusters.Max(c => c.Id) : 0;
     }
 
     public (IReadOnlyList<LayoutCluster> Clusters, IReadOnlyList<PdfTextCellDto> Cells) Postprocess()
@@ -204,8 +206,8 @@ public sealed class LayoutPostprocessor
         }
 
         var nextId = Math.Max(
-            _allClusters.Count > 0 ? _allClusters.Max(cluster => cluster.Id) : 0,
-            clusters.Max(cluster => cluster.Id)) + 1;
+            _maxClusterId,
+            clusters.Count > 0 ? clusters.Max(cluster => cluster.Id) : 0) + 1;
         var splitClusters = new List<LayoutCluster>(clusters.Count);
 
         foreach (var cluster in clusters)
@@ -480,7 +482,7 @@ public sealed class LayoutPostprocessor
         var usedClusterIds = new HashSet<int>();
         var syntheticTables = new List<LayoutCluster>();
         var nextId = Math.Max(
-            _allClusters.Count > 0 ? _allClusters.Max(cluster => cluster.Id) : 0,
+            _maxClusterId,
             _regularClusters.Count > 0 ? _regularClusters.Max(cluster => cluster.Id) : 0) + 1;
 
         for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++)
@@ -735,42 +737,55 @@ public sealed class LayoutPostprocessor
     {
         var rows = new List<List<LayoutCluster>>();
 
-        foreach (var cluster in clusters.OrderByDescending(c => c.Cells[0].Rect.ToBoundingBox().T).ThenBy(c => c.Cells[0].Rect.ToBoundingBox().L))
+        // Pre-compute bounding boxes once to avoid repeated ToBoundingBox() calls during sort and grouping
+        var clustersWithBoxes = clusters
+            .Select(c => (Cluster: c, Box: c.Cells[0].Rect.ToBoundingBox()))
+            .OrderByDescending(x => x.Box.T)
+            .ThenBy(x => x.Box.L)
+            .ToList();
+
+        // Running accumulators for the current row to replace O(n²) .Average() calls
+        double rowSumCenterY = 0;
+        double rowSumHeight = 0;
+        int rowCount = 0;
+
+        foreach (var (cluster, box) in clustersWithBoxes)
         {
-            var box = cluster.Cells[0].Rect.ToBoundingBox();
             var centerY = (box.T + box.B) / 2;
             var height = Math.Max(1.0, box.Height);
 
             if (rows.Count == 0)
             {
                 rows.Add([cluster]);
+                rowSumCenterY = centerY;
+                rowSumHeight = height;
+                rowCount = 1;
                 continue;
             }
 
-            var currentRow = rows[^1];
-            var rowCenterY = currentRow.Average(item =>
-            {
-                var rowBox = item.Cells[0].Rect.ToBoundingBox();
-                return (rowBox.T + rowBox.B) / 2;
-            });
-            var rowHeight = Math.Max(
-                1.0,
-                currentRow.Average(item => Math.Max(1.0, item.Cells[0].Rect.ToBoundingBox().Height)));
+            var rowCenterY = rowSumCenterY / rowCount;
+            var rowHeight = Math.Max(1.0, rowSumHeight / rowCount);
             var tolerance = Math.Max(6.0, Math.Max(height, rowHeight) * 0.6);
 
             if (Math.Abs(centerY - rowCenterY) <= tolerance)
             {
-                currentRow.Add(cluster);
+                rows[^1].Add(cluster);
+                rowSumCenterY += centerY;
+                rowSumHeight += height;
+                rowCount++;
             }
             else
             {
                 rows.Add([cluster]);
+                rowSumCenterY = centerY;
+                rowSumHeight = height;
+                rowCount = 1;
             }
         }
 
         foreach (var row in rows)
         {
-            row.Sort((left, right) => left.Cells[0].Rect.ToBoundingBox().L.CompareTo(right.Cells[0].Rect.ToBoundingBox().L));
+            row.Sort(static (left, right) => left.Cells[0].Rect.ToBoundingBox().L.CompareTo(right.Cells[0].Rect.ToBoundingBox().L));
         }
 
         return rows;
@@ -780,44 +795,55 @@ public sealed class LayoutPostprocessor
     {
         var rows = new List<List<PdfTextCellDto>>();
 
-        foreach (var cell in cells
-            .OrderByDescending(item => item.Rect.ToBoundingBox().T)
-            .ThenBy(item => item.Rect.ToBoundingBox().L))
+        // Pre-compute bounding boxes once to avoid repeated ToBoundingBox() calls during sort and grouping
+        var cellsWithBoxes = cells
+            .Select(c => (Cell: c, Box: c.Rect.ToBoundingBox()))
+            .OrderByDescending(x => x.Box.T)
+            .ThenBy(x => x.Box.L)
+            .ToList();
+
+        // Running accumulators for the current row to replace O(n²) .Average() calls
+        double rowSumCenterY = 0;
+        double rowSumHeight = 0;
+        int rowCount = 0;
+
+        foreach (var (cell, box) in cellsWithBoxes)
         {
-            var box = cell.Rect.ToBoundingBox();
             var centerY = (box.T + box.B) / 2;
             var height = Math.Max(1.0, box.Height);
 
             if (rows.Count == 0)
             {
                 rows.Add([cell]);
+                rowSumCenterY = centerY;
+                rowSumHeight = height;
+                rowCount = 1;
                 continue;
             }
 
-            var currentRow = rows[^1];
-            var rowCenterY = currentRow.Average(item =>
-            {
-                var rowBox = item.Rect.ToBoundingBox();
-                return (rowBox.T + rowBox.B) / 2;
-            });
-            var rowHeight = Math.Max(
-                1.0,
-                currentRow.Average(item => Math.Max(1.0, item.Rect.ToBoundingBox().Height)));
+            var rowCenterY = rowSumCenterY / rowCount;
+            var rowHeight = Math.Max(1.0, rowSumHeight / rowCount);
             var tolerance = Math.Max(6.0, Math.Max(height, rowHeight) * 0.6);
 
             if (Math.Abs(centerY - rowCenterY) <= tolerance)
             {
-                currentRow.Add(cell);
+                rows[^1].Add(cell);
+                rowSumCenterY += centerY;
+                rowSumHeight += height;
+                rowCount++;
             }
             else
             {
                 rows.Add([cell]);
+                rowSumCenterY = centerY;
+                rowSumHeight = height;
+                rowCount = 1;
             }
         }
 
         foreach (var row in rows)
         {
-            row.Sort((left, right) => left.Rect.ToBoundingBox().L.CompareTo(right.Rect.ToBoundingBox().L));
+            row.Sort(static (left, right) => left.Rect.ToBoundingBox().L.CompareTo(right.Rect.ToBoundingBox().L));
         }
 
         return rows;
@@ -872,10 +898,18 @@ public sealed class LayoutPostprocessor
             return cluster;
         }
 
-        var l = cluster.Cells.Min(cell => cell.Rect.ToBoundingBox().L);
-        var t = cluster.Cells.Max(cell => cell.Rect.ToBoundingBox().T);
-        var r = cluster.Cells.Max(cell => cell.Rect.ToBoundingBox().R);
-        var b = cluster.Cells.Min(cell => cell.Rect.ToBoundingBox().B);
+        var l = double.MaxValue;
+        var t = double.MinValue;
+        var r = double.MinValue;
+        var b = double.MaxValue;
+        foreach (var cell in cluster.Cells)
+        {
+            var box = cell.Rect.ToBoundingBox();
+            if (box.L < l) l = box.L;
+            if (box.T > t) t = box.T;
+            if (box.R > r) r = box.R;
+            if (box.B < b) b = box.B;
+        }
 
         cluster.Bbox = new BoundingBox(
             Math.Min(cluster.Bbox.L, l),
@@ -888,11 +922,18 @@ public sealed class LayoutPostprocessor
 
     private static BoundingBox GetBoundingBox(IReadOnlyList<PdfTextCellDto> cells)
     {
-        var l = cells.Min(cell => cell.Rect.ToBoundingBox().L);
-        var t = cells.Max(cell => cell.Rect.ToBoundingBox().T);
-        var r = cells.Max(cell => cell.Rect.ToBoundingBox().R);
-        var b = cells.Min(cell => cell.Rect.ToBoundingBox().B);
-
+        var l = double.MaxValue;
+        var t = double.MinValue;
+        var r = double.MinValue;
+        var b = double.MaxValue;
+        foreach (var cell in cells)
+        {
+            var box = cell.Rect.ToBoundingBox();
+            if (box.L < l) l = box.L;
+            if (box.T > t) t = box.T;
+            if (box.R > r) r = box.R;
+            if (box.B < b) b = box.B;
+        }
         return new BoundingBox(l, b, r, t);
     }
 
@@ -902,10 +943,18 @@ public sealed class LayoutPostprocessor
         {
             if (cluster.Cells.Count == 0) continue;
 
-            var l = cluster.Cells.Min(c => c.Rect.ToBoundingBox().L);
-            var t = cluster.Cells.Max(c => c.Rect.ToBoundingBox().T);
-            var r = cluster.Cells.Max(c => c.Rect.ToBoundingBox().R);
-            var b = cluster.Cells.Min(c => c.Rect.ToBoundingBox().B);
+            var l = double.MaxValue;
+            var t = double.MinValue;
+            var r = double.MinValue;
+            var b = double.MaxValue;
+            foreach (var c in cluster.Cells)
+            {
+                var box = c.Rect.ToBoundingBox();
+                if (box.L < l) l = box.L;
+                if (box.T > t) t = box.T;
+                if (box.R > r) r = box.R;
+                if (box.B < b) b = box.B;
+            }
 
             var cellsBox = new BoundingBox(l, b, r, t);
 

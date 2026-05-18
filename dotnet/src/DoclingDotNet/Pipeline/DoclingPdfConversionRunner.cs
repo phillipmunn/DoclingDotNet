@@ -399,9 +399,17 @@ public sealed class DoclingPdfConversionRunner
                                           var parseSession = EnsureSession(session);
                                           if (request.InputStream != null)
                                           {
-                                              using var ms = new MemoryStream();
+                                              // Pre-size from the stream length when available to avoid MemoryStream over-allocation,
+                                              // then use TryGetBuffer to skip the second copy that ToArray() would otherwise make.
+                                              var capacity = request.InputStream.CanSeek
+                                                  ? (int)request.InputStream.Length
+                                                  : 4 * 1024 * 1024;
+                                              using var ms = new MemoryStream(capacity);
                                               await request.InputStream.CopyToAsync(ms, token).ConfigureAwait(false);
-                                              pdfBytes = ms.ToArray();
+                                              ms.TryGetBuffer(out var segment);
+                                              pdfBytes = segment.Count == segment.Array!.Length
+                                                  ? segment.Array
+                                                  : ms.ToArray();
                                               parseSession.LoadDocumentFromBytes(documentKey, pdfBytes, "stream", request.Password);
                                           }
                                           else
