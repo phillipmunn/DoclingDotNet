@@ -34,7 +34,8 @@ public sealed class LatexDocumentBackend : IDocumentBackend
         long cellIndex = 0;
         double currentY = 1000.0;
 
-        var text = await new StreamReader(stream).ReadToEndAsync(cancellationToken);
+        using var reader = new StreamReader(stream, leaveOpen: true);
+        var text = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
         
         // Very basic LaTeX stripping for stub implementation
         var strippedText = Regex.Replace(text, @"\[a-zA-Z]+\{.*?\}", "");
